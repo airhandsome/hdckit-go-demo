@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Harmony设备投屏演示</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: Arial, sans-serif; background: #1a1a1a; color: #fff; }
+        .container { display: flex; height: 100vh; }
+        .sidebar { width: 300px; background: #2d2d2d; padding: 20px; }
+        .main { flex: 1; display: flex; flex-direction: column; }
+        .toolbar { height: 60px; background: #2d2d2d; display: flex; align-items: center; padding: 0 20px; }
+        .screen { flex: 1; background: #000; display: flex; justify-content: center; align-items: center; }
+        .device-screen { position: relative; border: 2px solid #404040; border-radius: 8px; background: #333; width: 300px; height: 600px; cursor: crosshair; display: flex; align-items: center; justify-content: center; }
+        .btn { background: #007acc; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; margin: 5px; }
+        .btn:hover { background: #005a9e; }
+        .device-item { background: #404040; padding: 15px; margin: 10px 0; border-radius: 8px; cursor: pointer; }
+        .device-item:hover { background: #505050; }
+        .status { padding: 10px; background: #2d2d2d; border-radius: 4px; margin: 10px 0; }
+        .placeholder { text-align: center; padding: 50px; color: #666; position: absolute; }
+        canvas { image-rendering: crisp-edges; display: block; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="sidebar">
+            <h2>设备列表</h2>
+            <div id="deviceList">正在扫描设备...</div>
+            <div class="status" id="status">未连接</div>
+            <button class="btn" onclick="startScreencast()">开始投屏</button>
+            <button class="btn" onclick="stopScreencast()">停止投屏</button>
+        </div>
+        <div class="main">
+            <div class="toolbar">
+                <span>Harmony设备投屏演示</span>
+                <button class="btn" onclick="refreshDevices()" style="margin-left: auto;">刷新设备</button>
+            </div>
+            <div class="screen">
+                <div class="device-screen" id="deviceScreen">
+                    <div class="placeholder" id="placeholder">
+                        <h3>等待设备连接...</h3>
+                        <p>请先选择设备并开始投屏</p>
+                    </div>
+                    <canvas id="screenCanvas"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        let currentDevice = null;
+        let isCapturing = false;
+        const deviceScreen = document.getElementById('deviceScreen');
+        const placeholder = document.getElementById('placeholder');
+        const canvas = document.getElementById('screenCanvas');
+        const ctx = canvas.getContext('2d');
+
+        // 当前源帧尺寸
+        let imgNaturalWidth = 0;
+        let imgNaturalHeight = 0;
+        // 上一次设置的显示尺寸
+        let lastDisplayWidth = 0;
+        let lastDisplayHeight = 0;
+        // rAF 绘制队列
+        let pendingBitmap = null;
+        let rafScheduled = false;
+
+        function connectWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(protocol + '//' + window.location.host + '/ws');
+            ws.binaryType = 'arraybuffer'; 
+            ws.onopen = () => {
+                document.getElementById('status').textContent = '已连接';
+                document.getElementById('status').style.background = '#28a745';
+            };
+            
+            ws.onmessage = (event) => {
+                const data = event.data;
+                if (typeof data === 'string') {
+                    try {
+                        const msg = JSON.parse(data);
+                        handleMessage(msg);
+                    } catch (e) {
+                        // 忽略非JSON文本
+                    }
+                } else if (data instanceof ArrayBuffer) {
+                    renderFrame(data);
+                } else if (data instanceof Blob) {
+                    data.arrayBuffer().then(renderFrame);
+                }
+            };
+            
+            ws.onclose = () => {
+                document.getElementById('status').textContent = '未连接';
+                document.getElementById('status').style.background = '#dc3545';
+                setTimeout(connectWebSocket, 3000);
+            };
+        }
+
+        // 仅在尺寸变化时调整 canvas 样式尺寸，避免频繁 reflow/repaint
+        function ensureCanvasDisplaySize() {
+            if (!imgNaturalWidth || !imgNaturalHeight) return;
+            const rect = deviceScreen.getBoundingClientRect();
+            const scale = Math.min(rect.width / imgNaturalWidth, rect.height / imgNaturalHeight);
+            const displayWidth = Math.max(1, Math.floor(imgNaturalWidth * scale));
+            const displayHeight = Math.max(1, Math.floor(imgNaturalHeight * scale));
+            if (displayWidth !== lastDisplayWidth || displayHeight !== lastDisplayHeight) {
+                canvas.style.width = displayWidth + 'px';
+                canvas.style.height = displayHeight + 'px';
+                lastDisplayWidth = displayWidth;
+                lastDisplayHeight = displayHeight;
+            }
+        }
+
+        // 将一帧安排到 rAF 绘制，避免多次同步绘制导致闪烁
+        function scheduleDraw(bitmap) {
+            pendingBitmap = bitmap;
+            if (rafScheduled) return;
+            rafScheduled = true;
+            requestAnimationFrame(() => {
+                rafScheduled = false;
+                if (!pendingBitmap) return;
+                // 如果源尺寸变化，更新内部像素尺寸（仅在变化时设置）
+                if (canvas.width !== imgNaturalWidth || canvas.height !== imgNaturalHeight) {
+                    canvas.width = imgNaturalWidth;
+                    canvas.height = imgNaturalHeight;
+                }
+                ensureCanvasDisplaySize();
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                ctx.drawImage(pendingBitmap, 0, 0);
+                if (placeholder.style.display !== 'none') placeholder.style.display = 'none';
+                // 释放位图资源
+                if (pendingBitmap.close) pendingBitmap.close();
+                pendingBitmap = null;
+            });
+        }
+
+        // 渲染二进制 JPEG 帧（使用 createImageBitmap 更平滑）
+        async function renderFrame(buffer) {
+            if (!isCapturing) return;
+            try {
+                const blob = new Blob([buffer], { type: 'image/jpeg' });
+                const bitmap = await createImageBitmap(blob);
+                imgNaturalWidth = bitmap.width;
+                imgNaturalHeight = bitmap.height;
+                scheduleDraw(bitmap);
+            } catch (e) {
+                // 忽略单帧解码错误
+            }
+        }
+
+        function handleMessage(data) {
+            switch(data.type) {
+                case 'devices':
+                    updateDeviceList(data.data);
+                    break;
+                case 'image':
+                    // 兼容 JSON/base64 路径（若后端仍发JSON）
+                    if (!isCapturing || !data.data) return;
+                    const img = new Image();
+                    img.onload = async () => {
+                        imgNaturalWidth = img.naturalWidth;
+                        imgNaturalHeight = img.naturalHeight;
+                        // 将 <img> 转成位图绘制
+                        const off = document.createElement('canvas');
+                        off.width = img.naturalWidth; off.height = img.naturalHeight;
+                        off.getContext('2d').drawImage(img, 0, 0);
+                        const blob = await new Promise(r => off.toBlob(r, 'image/jpeg'));
+                        const bitmap = await createImageBitmap(blob);
+                        scheduleDraw(bitmap);
+                    };
+                    img.src = 'data:image/jpeg;base64,' + data.data;
+                    break;
+            }
+        }
+
+        function updateDeviceList(devices) {
+            const deviceList = document.getElementById('deviceList');
+            deviceList.innerHTML = '';
+            devices.forEach(device => {
+                const div = document.createElement('div');
+                div.className = 'device-item';
+                div.innerHTML = `
+                    <div><strong>${device.name}</strong></div>
+                    <div>Key: ${device.key}</div>
+                    <div>版本: ${device.ohosVersion || ''}</div>
+                `;
+                div.onclick = (e) => selectDevice(e, device);
+                deviceList.appendChild(div);
+            });
+        }
+
+        function selectDevice(evt, device) {
+            currentDevice = device;
+            document.querySelectorAll('.device-item').forEach(item => {
+                item.style.background = '#404040';
+            });
+            evt.currentTarget.style.background = '#007acc';
+        }
+
+        function startScreencast() {
+            if (!currentDevice) { alert('请先选择设备'); return; }
+            fetch(`/api/devices/${currentDevice.key}/start`, { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.error) { alert('启动投屏失败: ' + data.error); return; }
+                    isCapturing = true;
+                    placeholder.style.display = 'none';
+                });
+        }
+
+        function stopScreencast() {
+            if (!currentDevice) return;
+            fetch(`/api/devices/${currentDevice.key}/stop`, { method: 'POST' })
+                .then(r => r.json())
+                .then(() => {
+                    isCapturing = false;
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    placeholder.style.display = '';
+                });
+        }
+
+        function refreshDevices() {
+            fetch('/api/devices')
+                .then(response => response.json())
+                .then(devices => updateDeviceList(devices));
+        }
+
+        function handleTouch(event, type) {
+            if (!isCapturing || !currentDevice) return;
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = rect.width / (imgNaturalWidth || rect.width);
+            const scaleY = rect.height / (imgNaturalHeight || rect.height);
+            const x = Math.round((event.clientX - rect.left) / scaleX);
+            const y = Math.round((event.clientY - rect.top) / scaleY);
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'touch', data: { type, x, y }, deviceKey: currentDevice.key }));
+            }
+        }
+
+        window.addEventListener('resize', () => {
+            ensureCanvasDisplaySize();
+        });
+
+        window.onload = () => {
+            connectWebSocket();
+            refreshDevices();
+            canvas.addEventListener('pointerdown', (e) => handleTouch(e, 'down'));
+            canvas.addEventListener('pointermove', (e) => handleTouch(e, 'move'));
+            canvas.addEventListener('pointerup', (e) => handleTouch(e, 'up'));
+        };
+    </script>
+</body>
+</html>
