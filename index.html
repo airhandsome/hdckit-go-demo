@@ -11,8 +11,10 @@
         .sidebar { width: 300px; background: #2d2d2d; padding: 20px; }
         .main { flex: 1; display: flex; flex-direction: column; }
         .toolbar { height: 60px; background: #2d2d2d; display: flex; align-items: center; padding: 0 20px; }
-        .screen { flex: 1; background: #000; display: flex; justify-content: center; align-items: center; }
+        .screen { flex: 1; background: #000; display: flex; justify-content: center; align-items: center; gap: 20px; }
         .device-screen { position: relative; border: 2px solid #404040; border-radius: 8px; background: #333; width: 300px; height: 600px; cursor: crosshair; display: flex; align-items: center; justify-content: center; }
+        .device-screen.active { border-color: #007acc; }
+        .device-screen.capturing { border-color: #28a745; }
         .btn { background: #007acc; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; margin: 5px; }
         .btn:hover { background: #005a9e; }
         .device-item { background: #404040; padding: 15px; margin: 10px 0; border-radius: 8px; cursor: pointer; }
@@ -28,8 +30,20 @@
             <h2>设备列表</h2>
             <div id="deviceList">正在扫描设备...</div>
             <div class="status" id="status">未连接</div>
-            <button class="btn" onclick="startScreencast()">开始投屏</button>
-            <button class="btn" onclick="stopScreencast()">停止投屏</button>
+            <div style="margin: 10px 0;">
+                <h4>槽位1</h4>
+                <button class="btn" onclick="startScreencast('1')" style="margin: 2px;">开始投屏</button>
+                <button class="btn" onclick="stopScreencast('1')" style="margin: 2px;">停止投屏</button>
+            </div>
+            <div style="margin: 10px 0;">
+                <h4>槽位2</h4>
+                <button class="btn" onclick="startScreencast('2')" style="margin: 2px;">开始投屏</button>
+                <button class="btn" onclick="stopScreencast('2')" style="margin: 2px;">停止投屏</button>
+            </div>
+            <div style="margin: 10px 0;">
+                <button class="btn" onclick="startScreencast()" style="background: #28a745;">全部开始</button>
+                <button class="btn" onclick="stopScreencast()" style="background: #dc3545;">全部停止</button>
+            </div>
         </div>
         <div class="main">
             <div class="toolbar">
@@ -37,12 +51,19 @@
                 <button class="btn" onclick="refreshDevices()" style="margin-left: auto;">刷新设备</button>
             </div>
             <div class="screen">
-                <div class="device-screen" id="deviceScreen">
-                    <div class="placeholder" id="placeholder">
-                        <h3>等待设备连接...</h3>
-                        <p>请先选择设备并开始投屏</p>
+                <div class="device-screen" id="deviceScreen1" data-device-key="">
+                    <div class="placeholder" id="placeholder1">
+                        <h3>设备1</h3>
+                        <p>请选择设备并开始投屏</p>
                     </div>
-                    <canvas id="screenCanvas"></canvas>
+                    <canvas id="screenCanvas1"></canvas>
+                </div>
+                <div class="device-screen" id="deviceScreen2" data-device-key="">
+                    <div class="placeholder" id="placeholder2">
+                        <h3>设备2</h3>
+                        <p>请选择设备并开始投屏</p>
+                    </div>
+                    <canvas id="screenCanvas2"></canvas>
                 </div>
             </div>
         </div>
@@ -50,22 +71,14 @@
 
     <script>
         let ws = null;
-        let currentDevice = null;
-        let isCapturing = false;
-        const deviceScreen = document.getElementById('deviceScreen');
-        const placeholder = document.getElementById('placeholder');
-        const canvas = document.getElementById('screenCanvas');
-        const ctx = canvas.getContext('2d');
-
-        // 当前源帧尺寸
-        let imgNaturalWidth = 0;
-        let imgNaturalHeight = 0;
-        // 上一次设置的显示尺寸
-        let lastDisplayWidth = 0;
-        let lastDisplayHeight = 0;
-        // rAF 绘制队列
-        let pendingBitmap = null;
-        let rafScheduled = false;
+        let devices = [];
+        let clientId = 'web-' + Date.now();
+        
+        // 设备状态管理
+        const deviceStates = {
+            '1': { device: null, isCapturing: false, canvas: null, ctx: null, imgNaturalWidth: 0, imgNaturalHeight: 0, lastDisplayWidth: 0, lastDisplayHeight: 0, pendingBitmap: null, rafScheduled: false },
+            '2': { device: null, isCapturing: false, canvas: null, ctx: null, imgNaturalWidth: 0, imgNaturalHeight: 0, lastDisplayWidth: 0, lastDisplayHeight: 0, pendingBitmap: null, rafScheduled: false }
+        };
 
         function connectWebSocket() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -78,17 +91,53 @@
             
             ws.onmessage = (event) => {
                 const data = event.data;
+                console.log('收到WebSocket消息，类型:', typeof data, '大小:', data instanceof ArrayBuffer ? data.byteLength : 'N/A');
+                
                 if (typeof data === 'string') {
                     try {
                         const msg = JSON.parse(data);
+                        console.log('解析JSON消息:', msg);
                         handleMessage(msg);
                     } catch (e) {
-                        // 忽略非JSON文本
+                        console.log('非JSON文本消息，忽略');
                     }
                 } else if (data instanceof ArrayBuffer) {
-                    renderFrame(data);
+                    console.log('收到ArrayBuffer数据，大小:', data.byteLength);
+                    // 解析二进制消息格式: deviceKey长度(4字节) + deviceKey + 帧数据
+                    const view = new DataView(data);
+                    if (data.byteLength < 4) {
+                        console.error('消息太短，无法解析');
+                        return;
+                    }
+                    
+                    // 读取设备Key长度（大端）
+                    const keyLen = view.getUint32(0);
+                    if (data.byteLength < 4 + keyLen) {
+                        console.error('消息格式错误，设备Key长度超出范围');
+                        return;
+                    }
+                    
+                    // 读取设备Key
+                    const deviceKeyBytes = new Uint8Array(data, 4, keyLen);
+                    const deviceKey = new TextDecoder().decode(deviceKeyBytes);
+                    
+                    // 读取帧数据
+                    const frameData = new Uint8Array(data, 4 + keyLen);
+                    
+                    // 打印前16字节十六进制、校验JPEG头尾
+                    const hex = Array.from(frameData.slice(0, 16)).map(b => b.toString(16).padStart(2, '0')).join(' ');
+                    const startOk = frameData.length >= 2 && frameData[0] === 0xFF && frameData[1] === 0xD8;
+                    const endOk = frameData.length >= 2 && frameData[frameData.length - 2] === 0xFF && frameData[frameData.length - 1] === 0xD9;
+                    console.log(`设备:${deviceKey} 帧大小:${frameData.length} 头部16字节:${hex} JPEG头:${startOk} 尾:${endOk}`);
+                    
+                    renderFrameToDevice(deviceKey, frameData);
                 } else if (data instanceof Blob) {
-                    data.arrayBuffer().then(renderFrame);
+                    console.log('收到Blob数据');
+                    data.arrayBuffer().then(buffer => {
+                        // 递归处理ArrayBuffer
+                        const event = { data: buffer };
+                        ws.onmessage(event);
+                    });
                 }
             };
             
@@ -137,46 +186,178 @@
             });
         }
 
-        // 渲染二进制 JPEG 帧（使用 createImageBitmap 更平滑）
-        async function renderFrame(buffer) {
-            if (!isCapturing) return;
+        // 渲染二进制 JPEG 帧到特定设备（接收 Uint8Array）
+        async function renderFrameToDevice(deviceKey, uint8) {
+            console.log('renderFrameToDevice called, deviceKey:', deviceKey, 'len:', uint8.length);
+            const slotId = getSlotIdByDeviceKey(deviceKey);
+            console.log('找到槽位ID:', slotId);
+            if (!slotId) {
+                console.error('未找到设备对应的槽位:', deviceKey);
+                return;
+            }
+            const state = deviceStates[slotId];
+            console.log('槽位状态:', state);
+            if (!state.isCapturing) {
+                console.log('槽位未在投屏中，跳过渲染');
+                return;
+            }
             try {
-                const blob = new Blob([buffer], { type: 'image/jpeg' });
+                // 再次校验JPEG头
+                if (!(uint8.length >= 2 && uint8[0] === 0xFF && uint8[1] === 0xD8)) {
+                    console.warn('非JPEG起始标识，尝试仍然解码');
+                }
+                const blob = new Blob([uint8], { type: 'image/jpeg' });
                 const bitmap = await createImageBitmap(blob);
-                imgNaturalWidth = bitmap.width;
-                imgNaturalHeight = bitmap.height;
-                scheduleDraw(bitmap);
+                console.log('ImageBitmap创建成功，尺寸:', bitmap.width, 'x', bitmap.height);
+                state.imgNaturalWidth = bitmap.width;
+                state.imgNaturalHeight = bitmap.height;
+                scheduleDrawToDevice(slotId, bitmap);
             } catch (e) {
-                // 忽略单帧解码错误
+                console.error('帧解码错误:', e);
+            }
+        }
+
+        // 渲染二进制 JPEG 帧（兼容旧格式）
+        async function renderFrame(buffer) {
+            // 如果只有一个设备在投屏，使用第一个槽位
+            const activeSlots = Object.keys(deviceStates).filter(id => deviceStates[id].isCapturing);
+            if (activeSlots.length === 1) {
+                const slotId = activeSlots[0];
+                const state = deviceStates[slotId];
+                try {
+                    const blob = new Blob([buffer], { type: 'image/jpeg' });
+                    const bitmap = await createImageBitmap(blob);
+                    state.imgNaturalWidth = bitmap.width;
+                    state.imgNaturalHeight = bitmap.height;
+                    scheduleDrawToDevice(slotId, bitmap);
+                } catch (e) {
+                    // 忽略单帧解码错误
+                }
+            }
+        }
+
+        // 根据设备Key获取槽位ID
+        function getSlotIdByDeviceKey(deviceKey) {
+            console.log('getSlotIdByDeviceKey called with:', deviceKey);
+            console.log('当前设备状态:', deviceStates);
+            for (const [slotId, state] of Object.entries(deviceStates)) {
+                console.log(`检查槽位 ${slotId}:`, state.device ? state.device.key : 'null');
+                if (state.device && state.device.key === deviceKey) {
+                    console.log(`找到匹配的槽位: ${slotId}`);
+                    return slotId;
+                }
+            }
+            console.log('未找到匹配的槽位');
+            return null;
+        }
+
+        // 获取可用的槽位
+        function getAvailableSlot() {
+            for (const [slotId, state] of Object.entries(deviceStates)) {
+                if (!state.device) {
+                    return slotId;
+                }
+            }
+            return null;
+        }
+
+        // 设备特定的绘制调度
+        function scheduleDrawToDevice(slotId, bitmap) {
+            console.log('scheduleDrawToDevice called, slotId:', slotId);
+            const state = deviceStates[slotId];
+            state.pendingBitmap = bitmap;
+            if (state.rafScheduled) {
+                console.log('rAF已调度，跳过');
+                return;
+            }
+            state.rafScheduled = true;
+            console.log('调度rAF绘制');
+            requestAnimationFrame(() => {
+                console.log('rAF执行绘制');
+                state.rafScheduled = false;
+                if (!state.pendingBitmap) {
+                    console.log('没有待绘制的位图');
+                    return;
+                }
+                
+                const deviceScreen = document.getElementById(`deviceScreen${slotId}`);
+                const canvas = state.canvas;
+                const ctx = state.ctx;
+                
+                console.log('开始绘制到canvas，尺寸:', state.imgNaturalWidth, 'x', state.imgNaturalHeight);
+                
+                // 如果源尺寸变化，更新内部像素尺寸
+                if (canvas.width !== state.imgNaturalWidth || canvas.height !== state.imgNaturalHeight) {
+                    console.log('更新canvas尺寸');
+                    canvas.width = state.imgNaturalWidth;
+                    canvas.height = state.imgNaturalHeight;
+                }
+                
+                ensureCanvasDisplaySize(slotId);
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                ctx.drawImage(state.pendingBitmap, 0, 0);
+                console.log('绘制完成');
+                
+                const placeholder = document.getElementById(`placeholder${slotId}`);
+                if (placeholder.style.display !== 'none') placeholder.style.display = 'none';
+                
+                // 释放位图资源
+                if (state.pendingBitmap.close) state.pendingBitmap.close();
+                state.pendingBitmap = null;
+            });
+        }
+
+        // 设备特定的Canvas尺寸调整
+        function ensureCanvasDisplaySize(slotId) {
+            const state = deviceStates[slotId];
+            if (!state.imgNaturalWidth || !state.imgNaturalHeight) return;
+            
+            const deviceScreen = document.getElementById(`deviceScreen${slotId}`);
+            const rect = deviceScreen.getBoundingClientRect();
+            const scale = Math.min(rect.width / state.imgNaturalWidth, rect.height / state.imgNaturalHeight);
+            const displayWidth = Math.max(1, Math.floor(state.imgNaturalWidth * scale));
+            const displayHeight = Math.max(1, Math.floor(state.imgNaturalHeight * scale));
+            
+            if (displayWidth !== state.lastDisplayWidth || displayHeight !== state.lastDisplayHeight) {
+                state.canvas.style.width = displayWidth + 'px';
+                state.canvas.style.height = displayHeight + 'px';
+                state.lastDisplayWidth = displayWidth;
+                state.lastDisplayHeight = displayHeight;
             }
         }
 
         function handleMessage(data) {
             switch(data.type) {
                 case 'devices':
+                    devices = data.data;
                     updateDeviceList(data.data);
                     break;
                 case 'image':
                     // 兼容 JSON/base64 路径（若后端仍发JSON）
-                    if (!isCapturing || !data.data) return;
-                    const img = new Image();
-                    img.onload = async () => {
-                        imgNaturalWidth = img.naturalWidth;
-                        imgNaturalHeight = img.naturalHeight;
-                        // 将 <img> 转成位图绘制
-                        const off = document.createElement('canvas');
-                        off.width = img.naturalWidth; off.height = img.naturalHeight;
-                        off.getContext('2d').drawImage(img, 0, 0);
-                        const blob = await new Promise(r => off.toBlob(r, 'image/jpeg'));
-                        const bitmap = await createImageBitmap(blob);
-                        scheduleDraw(bitmap);
-                    };
-                    img.src = 'data:image/jpeg;base64,' + data.data;
+                    const activeSlots = Object.keys(deviceStates).filter(id => deviceStates[id].isCapturing);
+                    if (activeSlots.length === 1 && data.data) {
+                        const slotId = activeSlots[0];
+                        const state = deviceStates[slotId];
+                        const img = new Image();
+                        img.onload = async () => {
+                            state.imgNaturalWidth = img.naturalWidth;
+                            state.imgNaturalHeight = img.naturalHeight;
+                            // 将 <img> 转成位图绘制
+                            const off = document.createElement('canvas');
+                            off.width = img.naturalWidth; off.height = img.naturalHeight;
+                            off.getContext('2d').drawImage(img, 0, 0);
+                            const blob = await new Promise(r => off.toBlob(r, 'image/jpeg'));
+                            const bitmap = await createImageBitmap(blob);
+                            scheduleDrawToDevice(slotId, bitmap);
+                        };
+                        img.src = 'data:image/jpeg;base64,' + data.data;
+                    }
                     break;
             }
         }
 
         function updateDeviceList(devices) {
+            console.log('updateDeviceList called with:', devices);
             const deviceList = document.getElementById('deviceList');
             deviceList.innerHTML = '';
             devices.forEach(device => {
@@ -186,70 +367,200 @@
                     <div><strong>${device.name}</strong></div>
                     <div>Key: ${device.key}</div>
                     <div>版本: ${device.ohosVersion || ''}</div>
+                    <div style="margin-top: 10px;">
+                        <button class="btn" onclick="assignDevice('1', '${device.key}')" style="font-size: 12px; padding: 4px 8px;">分配到槽位1</button>
+                        <button class="btn" onclick="assignDevice('2', '${device.key}')" style="font-size: 12px; padding: 4px 8px;">分配到槽位2</button>
+                        <button class="btn" onclick="console.log('Test button clicked')" style="font-size: 12px; padding: 4px 8px; background: #ff6b6b;">测试按钮</button>
+                    </div>
                 `;
-                div.onclick = (e) => selectDevice(e, device);
                 deviceList.appendChild(div);
             });
         }
 
-        function selectDevice(evt, device) {
-            currentDevice = device;
-            document.querySelectorAll('.device-item').forEach(item => {
-                item.style.background = '#404040';
-            });
-            evt.currentTarget.style.background = '#007acc';
+        function assignDevice(slotId, deviceKey) {
+            console.log('assignDevice called:', slotId, deviceKey);
+            console.log('Available devices:', devices);
+            const device = devices.find(d => d.key === deviceKey);
+            if (!device) {
+                console.error('Device not found:', deviceKey);
+                return;
+            }
+            
+            const state = deviceStates[slotId];
+            const deviceScreen = document.getElementById(`deviceScreen${slotId}`);
+            const placeholder = document.getElementById(`placeholder${slotId}`);
+            
+            // 如果槽位已有设备，先停止投屏
+            if (state.device) {
+                console.log(`槽位${slotId}已有设备${state.device.key}，先停止投屏`);
+                stopScreencast(slotId);
+            }
+            
+            // 分配新设备
+            state.device = device;
+            deviceScreen.setAttribute('data-device-key', deviceKey);
+            deviceScreen.classList.add('active');
+            placeholder.innerHTML = `
+                <h3>设备${slotId}</h3>
+                <p>${device.name}</p>
+                <p>已分配，点击开始投屏</p>
+            `;
+            
+            console.log(`设备 ${device.name} 已分配到槽位 ${slotId}`);
+            console.log('当前设备状态:', deviceStates);
+            
+            // 显示每个槽位的状态
+            for (const [id, state] of Object.entries(deviceStates)) {
+                console.log(`槽位${id}:`, state.device ? state.device.key : '无设备', '投屏状态:', state.isCapturing);
+            }
         }
 
-        function startScreencast() {
-            if (!currentDevice) { alert('请先选择设备'); return; }
-            fetch(`/api/devices/${currentDevice.key}/start`, { method: 'POST' })
-                .then(r => r.json())
+        function startScreencast(slotId = null) {
+            console.log('startScreencast called with slotId:', slotId);
+            if (slotId) {
+                // 启动特定槽位的投屏
+                const state = deviceStates[slotId];
+                console.log('槽位状态:', state);
+                if (!state.device) { 
+                    console.error(`槽位${slotId}没有分配设备`);
+                    alert(`槽位${slotId}没有分配设备`); 
+                    return; 
+                }
+                
+                if (state.isCapturing) {
+                    console.log(`槽位${slotId}已经在投屏中`);
+                    alert(`槽位${slotId}已经在投屏中`);
+                    return;
+                }
+                
+                console.log(`启动槽位${slotId}的投屏，设备:`, state.device);
+                const headers = { 'X-Client-ID': clientId };
+                fetch(`/api/devices/${state.device.key}/start?clientId=${clientId}`, { 
+                    method: 'POST',
+                    headers: headers
+                })
+                .then(r => {
+                    console.log('投屏启动响应状态:', r.status);
+                    return r.json();
+                })
                 .then(data => {
-                    if (data.error) { alert('启动投屏失败: ' + data.error); return; }
-                    isCapturing = true;
+                    console.log('投屏启动响应数据:', data);
+                    if (data.error) { 
+                        console.error('启动投屏失败:', data.error);
+                        alert(`启动投屏失败: ${data.error}`); 
+                        return; 
+                    }
+                    state.isCapturing = true;
+                    const deviceScreen = document.getElementById(`deviceScreen${slotId}`);
+                    deviceScreen.classList.add('capturing');
+                    const placeholder = document.getElementById(`placeholder${slotId}`);
                     placeholder.style.display = 'none';
+                    console.log(`槽位${slotId}投屏已启动`);
+                    
+                    // 显示所有槽位状态
+                    for (const [id, s] of Object.entries(deviceStates)) {
+                        console.log(`槽位${id}:`, s.device ? s.device.key : '无设备', '投屏状态:', s.isCapturing);
+                    }
+                })
+                .catch(error => {
+                    console.error('投屏启动请求失败:', error);
+                    alert('投屏启动请求失败: ' + error.message);
                 });
+            } else {
+                // 启动所有已分配设备的投屏
+                console.log('启动所有设备的投屏');
+                for (const [id, state] of Object.entries(deviceStates)) {
+                    if (state.device && !state.isCapturing) {
+                        startScreencast(id);
+                    }
+                }
+            }
         }
 
-        function stopScreencast() {
-            if (!currentDevice) return;
-            fetch(`/api/devices/${currentDevice.key}/stop`, { method: 'POST' })
+        function stopScreencast(slotId = null) {
+            if (slotId) {
+                // 停止特定槽位的投屏
+                const state = deviceStates[slotId];
+                if (!state.device) return;
+                
+                fetch(`/api/devices/${state.device.key}/stop`, { method: 'POST' })
                 .then(r => r.json())
                 .then(() => {
-                    isCapturing = false;
-                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    state.isCapturing = false;
+                    const deviceScreen = document.getElementById(`deviceScreen${slotId}`);
+                    deviceScreen.classList.remove('capturing');
+                    const placeholder = document.getElementById(`placeholder${slotId}`);
                     placeholder.style.display = '';
+                    if (state.ctx) {
+                        state.ctx.clearRect(0, 0, state.canvas.width, state.canvas.height);
+                    }
+                    console.log(`槽位${slotId}投屏已停止`);
                 });
+            } else {
+                // 停止所有设备的投屏
+                for (const [id, state] of Object.entries(deviceStates)) {
+                    if (state.device && state.isCapturing) {
+                        stopScreencast(id);
+                    }
+                }
+            }
         }
 
         function refreshDevices() {
             fetch('/api/devices')
                 .then(response => response.json())
-                .then(devices => updateDeviceList(devices));
+                .then(deviceList => {
+                    devices = deviceList; // 更新全局devices变量
+                    updateDeviceList(deviceList);
+                })
+                .catch(error => {
+                    console.error('获取设备列表失败:', error);
+                    devices = []; // 设置为空数组
+                    updateDeviceList([]);
+                });
         }
 
-        function handleTouch(event, type) {
-            if (!isCapturing || !currentDevice) return;
+        function handleTouch(event, type, slotId) {
+            const state = deviceStates[slotId];
+            if (!state.isCapturing || !state.device) return;
+            
+            const canvas = state.canvas;
             const rect = canvas.getBoundingClientRect();
-            const scaleX = rect.width / (imgNaturalWidth || rect.width);
-            const scaleY = rect.height / (imgNaturalHeight || rect.height);
+            const scaleX = rect.width / (state.imgNaturalWidth || rect.width);
+            const scaleY = rect.height / (state.imgNaturalHeight || rect.height);
             const x = Math.round((event.clientX - rect.left) / scaleX);
             const y = Math.round((event.clientY - rect.top) / scaleY);
+            
             if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'touch', data: { type, x, y }, deviceKey: currentDevice.key }));
+                ws.send(JSON.stringify({ 
+                    type: 'touch', 
+                    data: { type, x, y }, 
+                    deviceKey: state.device.key 
+                }));
             }
         }
 
         window.addEventListener('resize', () => {
-            ensureCanvasDisplaySize();
+            for (const slotId of Object.keys(deviceStates)) {
+                ensureCanvasDisplaySize(slotId);
+            }
         });
 
         window.onload = () => {
+            // 初始化设备状态
+            for (const slotId of Object.keys(deviceStates)) {
+                const state = deviceStates[slotId];
+                state.canvas = document.getElementById(`screenCanvas${slotId}`);
+                state.ctx = state.canvas.getContext('2d');
+                
+                // 添加触摸事件监听
+                state.canvas.addEventListener('pointerdown', (e) => handleTouch(e, 'down', slotId));
+                state.canvas.addEventListener('pointermove', (e) => handleTouch(e, 'move', slotId));
+                state.canvas.addEventListener('pointerup', (e) => handleTouch(e, 'up', slotId));
+            }
+            
             connectWebSocket();
             refreshDevices();
-            canvas.addEventListener('pointerdown', (e) => handleTouch(e, 'down'));
-            canvas.addEventListener('pointermove', (e) => handleTouch(e, 'move'));
-            canvas.addEventListener('pointerup', (e) => handleTouch(e, 'up'));
         };
     </script>
 </body>
