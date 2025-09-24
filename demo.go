@@ -334,7 +334,7 @@ func main() {
 	// 从环境变量获取HDC服务器配置，默认使用远程服务器
 	hdcHost := os.Getenv("HDC_HOST")
 	if hdcHost == "" {
-		hdcHost = "10.86.97.52"
+		hdcHost = "127.0.0.1"
 	}
 
 	hdcPortStr := os.Getenv("HDC_PORT")
